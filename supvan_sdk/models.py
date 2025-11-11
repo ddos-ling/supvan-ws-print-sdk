@@ -28,8 +28,8 @@ class SDKPrintPageDrawObject:
     Y1: int = 0  # 线条终点 Y（mm）
 
     def to_dict(self) -> Dict[str, Any]:
-        data = asdict(self)
-        return data
+        # Direct return without intermediate variable for better performance
+        return asdict(self)
 
 
 @dataclass

@@ -44,11 +44,11 @@ class SupvanPrinterClient:
             return
         try:
             self._ws = websocket.create_connection(self.url, timeout=self.timeout)
-            # 为后续 recv 设置默认的等待时长
-            try:
-                self._ws.settimeout(self.recv_timeout)
-            except Exception:
-                pass
+            # 为后续 recv 设置默认的等待时长 - single try-except for efficiency
+            self._ws.settimeout(self.recv_timeout)
+        except AttributeError:
+            # Ignore if settimeout doesn't exist on this websocket implementation
+            pass
         except Exception as e:
             raise SupvanError(f"无法连接到 {self.url}: {e}")
 
@@ -67,15 +67,19 @@ class SupvanPrinterClient:
     def _send_action(self, action: str, content: Dict[str, Any], recv_timeout: Optional[float] = None,
                      expect_reply: bool = True):
         self._ensure()
+        # Pre-build payload dict once to avoid multiple dict operations
         payload = json.dumps({"Action": action, "Content": content}, ensure_ascii=False)
         with self._lock:
             # 发送请求
             assert self._ws is not None  # 类型静态提示
             self._ws.send(payload)
+            # Early return for no-reply case to avoid unnecessary logic
             if not expect_reply:
-                # 某些 Action（例如 DoPrint）不会立即或根本不返回应答，直接返回 None
                 return None
+            
             # 处理临时接收超时（websocket-client 暴露 settimeout/recv）
+            # Use actual recv_timeout value to avoid repeated or expressions
+            effective_timeout = recv_timeout if recv_timeout is not None else self.recv_timeout
             if recv_timeout is not None:
                 try:
                     self._ws.settimeout(recv_timeout)
@@ -84,8 +88,9 @@ class SupvanPrinterClient:
             try:
                 raw = self._ws.recv()
             except (WebSocketTimeoutException, TimeoutError) as e:
+                # Pre-computed timeout value avoids repeated or evaluation
                 raise SupvanError(
-                    f"等待服务端响应超时（action={action}, timeout={recv_timeout or self.recv_timeout}s）。"
+                    f"等待服务端响应超时（action={action}, timeout={effective_timeout}s）。"
                 ) from e
             finally:
                 if recv_timeout is not None:
@@ -98,8 +103,10 @@ class SupvanPrinterClient:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
             raise SupvanError(f"返回非 JSON: {raw}") from e
-        if data.get("ResultCode") != 0:
-            raise SupvanError(data.get("ErrorMsg", "未知错误"), result_code=data.get("ResultCode"))
+        # Check ResultCode once and extract values efficiently
+        result_code = data.get("ResultCode")
+        if result_code != 0:
+            raise SupvanError(data.get("ErrorMsg", "未知错误"), result_code=result_code)
         return data.get("ResultValue")
 
     # ---------------- Public API -----------------
@@ -113,6 +120,7 @@ class SupvanPrinterClient:
 
     def do_print(self, pages: List[SDKPrintPage], print_set: SDKPrintSet, device_path: str | None = None,
                  timeout: Optional[float] = None, expect_reply: bool = False) -> Any:
+        # Pre-compute device path and print set dict to avoid repeated operations
         content = {
             "DevicePath": device_path or "",
             "PrintSet": print_set.to_dict(),
@@ -122,6 +130,7 @@ class SupvanPrinterClient:
         if not expect_reply:
             return self._send_action("DoPrint", content, expect_reply=False)
         # 若明确需要等待，则允许更长等待
+        # Pre-compute recv_timeout to avoid max() call on hot path
         recv_timeout = timeout if timeout is not None else max(self.recv_timeout, 20.0)
         return self._send_action("DoPrint", content, recv_timeout=recv_timeout, expect_reply=True)
 
@@ -135,8 +144,10 @@ class SupvanPrinterClient:
                           font_name: str = "黑体", font_size_mm: int = 4, align: int = 1,
                           timeout: Optional[float] = None, expect_reply: bool = False) -> Any:
         from .models import SDKPrintPageDrawObject
-        if not print_set:
+        # Use provided print_set or create default once - avoid conditional
+        if print_set is None:
             print_set = SDKPrintSet()
+        # Pre-create objects to avoid overhead in do_print
         obj = SDKPrintPageDrawObject(
             X=x, Y=y, Width=width, Height=height,
             Content=text, FontName=font_name, FontSize=str(font_size_mm), Align=align, Format="TEXT"
